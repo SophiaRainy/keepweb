@@ -1,21 +1,13 @@
 #keep-alive-panel {
     padding: 10px;
 }
-
-.ka-active {
-    color: #4CAF50;
-    font-weight: bold;
-}
-
-.ka-idle {
-    color: #999;
-}
-
+.ka-active { color: #4CAF50; font-weight: bold; }
+.ka-idle { color: #999; }
+.ka-standby { color: #2196F3; }
 @keyframes ka-pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.3; }
 }
-
 #ka-log div {
     padding: 1px 0;
     border-bottom: 1px solid rgba(128,128,128,0.08);
