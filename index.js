@@ -1,8 +1,10 @@
 /**
- * Keep Alive - 智能后台保活
+ * Keep Alive v2 - 智能后台保活（最终版）
  * 
- * 只在 AI 正在生成回复时才启动保活，生成完毕自动释放
- * 不浪费任何后台资源
+ * 设计思路：
+ * - Worker 心跳永远开着（极低消耗，但防止主线程冻结）
+ * - 音频/WakeLock 只在 AI 生成时开启（省资源）
+ * - 由 Worker 驱动检测，不依赖主线程 setInterval
  */
 
 import { saveSettingsDebounced } from '../../../../script.js';
@@ -11,137 +13,65 @@ import { extension_settings } from '../../../extensions.js';
 const extensionName = 'SillyTavern-KeepAlive';
 const defaultSettings = {
     enabled: true,
-    useWorker: true,
     useAudio: true,
-    useLocks: true,
     useWakeLock: true,
+    useLocks: true,
 };
 
+// ============ 状态 ============
 let worker = null;
 let audioCtx = null;
 let audioSource = null;
 let wakeLock = null;
-let lockHeld = false;
+let lockResolve = null;
 
-let isAlive = false;          // 保活是否正在运行
-let isGenerating = false;     // AI 是否正在生成
-let checkTimer = null;        // 检测生成状态的定时器
+let isGenerating = false;   // AI 是否正在生成
+let boostActive = false;    // 重资源保活是否激活
 let heartbeatCount = 0;
 
-// ==============================================
-// 检测 AI 是否正在生成
-// ==============================================
-function checkIsGenerating() {
-    // 方法1: 停止按钮可见 = 正在生成
-    const stopBtn = document.getElementById('mes_stop');
-    if (stopBtn && stopBtn.offsetParent !== null) return true;
-
-    // 方法2: 发送按钮区域的状态
-    const sendBtn = document.getElementById('send_but');
-    if (sendBtn && sendBtn.style.display === 'none') return true;
-
-    return false;
-}
-
-// ==============================================
-// 状态监控 — 每秒检测一次生成状态
-// ==============================================
-function startMonitor() {
-    if (checkTimer) return;
-
-    checkTimer = setInterval(() => {
-        if (!getSettings().enabled) return;
-
-        const generating = checkIsGenerating();
-
-        if (generating && !isGenerating) {
-            // 刚开始生成 → 启动保活
-            isGenerating = true;
-            activateKeepAlive();
-            log('✏️ 检测到 AI 开始生成 → 保活已激活');
-        }
-
-        if (!generating && isGenerating) {
-            // 生成结束 → 释放保活
-            isGenerating = false;
-            deactivateKeepAlive();
-            log('✅ AI 生成完毕 → 保活已释放');
-        }
-
-    }, 1000);
-}
-
-function stopMonitor() {
-    if (checkTimer) {
-        clearInterval(checkTimer);
-        checkTimer = null;
-    }
-}
-
-// ==============================================
-// 激活保活（仅在生成时）
-// ==============================================
-function activateKeepAlive() {
-    if (isAlive) return;
-    isAlive = true;
-
-    const s = getSettings();
-    if (s.useWorker) startWorkerHeartbeat();
-    if (s.useAudio) startSilentAudio();
-    if (s.useLocks) acquireWebLock();
-    if (s.useWakeLock) requestWakeLock();
-
-    updateStatus('🟢 保活中 (AI生成中...)', true);
-}
-
-// ==============================================
-// 释放保活（生成结束时）
-// ==============================================
-function deactivateKeepAlive() {
-    if (!isAlive) return;
-    isAlive = false;
-
-    stopWorkerHeartbeat();
-    stopSilentAudio();
-    releaseWakeLock();
-    lockHeld = false;
-    heartbeatCount = 0;
-
-    updateStatus('💤 待机中 (等待AI生成)', false);
-}
-
-// ==============================================
-// 手段 1: Web Worker 心跳
-// ==============================================
-function startWorkerHeartbeat() {
+// ============================================
+// Worker：永远运行，每秒发心跳
+// 这是整个插件的"心脏"，它不受后台冻结影响
+// 每次收到心跳就检查一次 AI 生成状态
+// ============================================
+function startWorker() {
     if (worker) return;
+
+    const code = `
+        let iv = null;
+        self.onmessage = function(e) {
+            if (e.data === 'start') {
+                if (iv) clearInterval(iv);
+                iv = setInterval(() => self.postMessage('tick'), 1000);
+            }
+            if (e.data === 'stop') {
+                if (iv) clearInterval(iv);
+                iv = null;
+            }
+        };
+    `;
+
     try {
-        const code = `
-            let iv = null;
-            self.onmessage = function(e) {
-                if (e.data === 'start') {
-                    if (iv) clearInterval(iv);
-                    iv = setInterval(() => self.postMessage('hb'), 1000);
-                } else if (e.data === 'stop') {
-                    if (iv) clearInterval(iv);
-                    iv = null;
-                }
-            };
-        `;
         const blob = new Blob([code], { type: 'application/javascript' });
         worker = new Worker(URL.createObjectURL(blob));
-        worker.onmessage = () => {
+
+        worker.onmessage = function () {
             heartbeatCount++;
-            const el = document.getElementById('ka-hb');
-            if (el) el.textContent = heartbeatCount;
+            // Worker 每秒触发一次，由它来驱动主线程检测
+            onTick();
         };
+
         worker.postMessage('start');
+        log('✅ Worker 心跳已启动（常驻）');
     } catch (e) {
-        console.warn('[KeepAlive] Worker 不可用:', e);
+        console.warn('[KeepAlive] Worker 创建失败:', e);
+        // Worker 不可用时 fallback 到 setInterval
+        setInterval(onTick, 1000);
+        log('⚠️ Worker 不可用，使用 fallback');
     }
 }
 
-function stopWorkerHeartbeat() {
+function stopWorker() {
     if (worker) {
         worker.postMessage('stop');
         worker.terminate();
@@ -149,10 +79,90 @@ function stopWorkerHeartbeat() {
     }
 }
 
-// ==============================================
-// 手段 2: 静音音频
-// ==============================================
-function startSilentAudio() {
+// ============================================
+// 每秒被 Worker 调用：检测 AI 是否在生成
+// ============================================
+function onTick() {
+    if (!getSettings().enabled) return;
+
+    // 更新心跳 UI
+    const hbEl = document.getElementById('ka-hb');
+    if (hbEl) hbEl.textContent = heartbeatCount;
+
+    // 检测 AI 是否在生成
+    const nowGenerating = checkIsGenerating();
+
+    if (nowGenerating && !isGenerating) {
+        // === 刚开始生成 → 启动重资源保活 ===
+        isGenerating = true;
+        activateBoost();
+        log('✏️ AI 开始生成 → 全力保活');
+    }
+
+    if (!nowGenerating && isGenerating) {
+        // === 生成结束 → 释放重资源 ===
+        isGenerating = false;
+        deactivateBoost();
+        log('✅ AI 生成完毕 → 仅保留心跳');
+    }
+}
+
+// ============================================
+// 检测 AI 是否正在生成
+// ============================================
+function checkIsGenerating() {
+    // 停止按钮可见
+    const stopBtn = document.getElementById('mes_stop');
+    if (stopBtn) {
+        const style = window.getComputedStyle(stopBtn);
+        if (style.display !== 'none' && stopBtn.offsetParent !== null) {
+            return true;
+        }
+    }
+
+    // send_but 被隐藏（正在生成时酒馆会隐藏发送按钮）
+    const sendBtn = document.getElementById('send_but');
+    if (sendBtn) {
+        const style = window.getComputedStyle(sendBtn);
+        if (style.display === 'none' || style.visibility === 'hidden') {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// ============================================
+// 重资源保活：音频 + WakeLock + Locks
+// 只在 AI 生成时激活
+// ============================================
+function activateBoost() {
+    if (boostActive) return;
+    boostActive = true;
+
+    const s = getSettings();
+    if (s.useAudio) startAudio();
+    if (s.useWakeLock) requestWakeLock();
+    if (s.useLocks) acquireLock();
+
+    updateStatus('🟢 全力保活中 (AI生成中)', 'ka-active');
+}
+
+function deactivateBoost() {
+    if (!boostActive) return;
+    boostActive = false;
+
+    stopAudio();
+    releaseWakeLock();
+    releaseLock();
+
+    updateStatus('💙 心跳待机中', 'ka-standby');
+}
+
+// ============================================
+// 静音音频
+// ============================================
+function startAudio() {
     if (audioCtx) return;
     try {
         audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -164,53 +174,26 @@ function startSilentAudio() {
         gain.connect(audioCtx.destination);
         osc.start();
         audioSource = osc;
-    } catch (e) {
-        console.warn('[KeepAlive] Audio 不可用:', e);
-    }
+    } catch (e) { }
 }
 
-function stopSilentAudio() {
+function stopAudio() {
     try {
         if (audioSource) { audioSource.stop(); audioSource = null; }
         if (audioCtx) { audioCtx.close(); audioCtx = null; }
     } catch (e) { }
 }
 
-// ==============================================
-// 手段 3: Web Locks
-// ==============================================
-function acquireWebLock() {
-    if (lockHeld || !navigator.locks) return;
-    try {
-        navigator.locks.request('st-keep-alive-' + Date.now(), { mode: 'exclusive' }, () => {
-            lockHeld = true;
-            return new Promise((resolve) => {
-                // 保存 resolve，释放时调用
-                window._kaLockResolve = resolve;
-            });
-        });
-    } catch (e) { }
-}
-
-function releaseWebLock() {
-    if (window._kaLockResolve) {
-        window._kaLockResolve();
-        window._kaLockResolve = null;
-    }
-    lockHeld = false;
-}
-
-// ==============================================
-// 手段 4: Screen Wake Lock
-// ==============================================
+// ============================================
+// Screen Wake Lock
+// ============================================
 async function requestWakeLock() {
     if (wakeLock || !('wakeLock' in navigator)) return;
     try {
         wakeLock = await navigator.wakeLock.request('screen');
         wakeLock.addEventListener('release', () => {
             wakeLock = null;
-            // 如果还在生成中，自动重新获取
-            if (isAlive && getSettings().useWakeLock) {
+            if (boostActive && getSettings().useWakeLock) {
                 setTimeout(requestWakeLock, 1000);
             }
         });
@@ -218,32 +201,52 @@ async function requestWakeLock() {
 }
 
 function releaseWakeLock() {
-    if (wakeLock) {
-        wakeLock.release();
-        wakeLock = null;
-    }
+    if (wakeLock) { wakeLock.release(); wakeLock = null; }
 }
 
-// ==============================================
-// Visibility 恢复
-// ==============================================
-function setupVisibilityListener() {
+// ============================================
+// Web Locks
+// ============================================
+function acquireLock() {
+    if (lockResolve || !navigator.locks) return;
+    try {
+        navigator.locks.request('st-keepalive-' + Date.now(), () => {
+            return new Promise(resolve => { lockResolve = resolve; });
+        });
+    } catch (e) { }
+}
+
+function releaseLock() {
+    if (lockResolve) { lockResolve(); lockResolve = null; }
+}
+
+// ============================================
+// Visibility 监听
+// ============================================
+function setupVisibility() {
     document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'visible') {
-            // 切回前台
+            log('📱 切回前台');
+            // 恢复 AudioContext
             if (audioCtx && audioCtx.state === 'suspended') {
                 audioCtx.resume();
             }
-            if (isAlive && getSettings().useWakeLock) {
+            // 如果正在生成但 boost 没开，补开
+            if (isGenerating && !boostActive) {
+                activateBoost();
+            }
+            if (boostActive && getSettings().useWakeLock) {
                 requestWakeLock();
             }
+        } else {
+            log('📱 切到后台' + (isGenerating ? ' (AI生成中，保活已激活)' : ''));
         }
     });
 }
 
-// ==============================================
+// ============================================
 // 工具
-// ==============================================
+// ============================================
 function getSettings() {
     return extension_settings[extensionName] || defaultSettings;
 }
@@ -254,71 +257,72 @@ function log(msg) {
     if (el) {
         const time = new Date().toLocaleTimeString('zh-CN');
         el.innerHTML = `<div>[${time}] ${msg}</div>` + el.innerHTML;
-        // 最多保留 10 条
-        while (el.children.length > 10) el.removeChild(el.lastChild);
+        while (el.children.length > 15) el.removeChild(el.lastChild);
     }
 }
 
-function updateStatus(text, active) {
+function updateStatus(text, cls) {
     const el = document.getElementById('ka-status-text');
-    if (el) {
-        el.textContent = text;
-        el.className = active ? 'ka-active' : 'ka-idle';
-    }
+    if (el) { el.textContent = text; el.className = cls || ''; }
+
     const dot = document.getElementById('ka-dot');
     if (dot) {
-        dot.style.background = active ? '#4CAF50' : '#999';
-        dot.style.animationPlayState = active ? 'running' : 'paused';
+        if (cls === 'ka-active') {
+            dot.style.background = '#4CAF50';
+            dot.style.animationPlayState = 'running';
+        } else if (cls === 'ka-standby') {
+            dot.style.background = '#2196F3';
+            dot.style.animationPlayState = 'running';
+        } else {
+            dot.style.background = '#999';
+            dot.style.animationPlayState = 'paused';
+        }
     }
 }
 
-// ==============================================
+// ============================================
 // 加载设置
-// ==============================================
+// ============================================
 function loadSettings() {
     extension_settings[extensionName] = extension_settings[extensionName] || {};
-    for (const [key, value] of Object.entries(defaultSettings)) {
-        if (extension_settings[extensionName][key] === undefined) {
-            extension_settings[extensionName][key] = value;
-        }
+    for (const [k, v] of Object.entries(defaultSettings)) {
+        if (extension_settings[extensionName][k] === undefined)
+            extension_settings[extensionName][k] = v;
     }
     const s = getSettings();
     $('#ka-enabled').prop('checked', s.enabled);
-    $('#ka-use-worker').prop('checked', s.useWorker);
     $('#ka-use-audio').prop('checked', s.useAudio);
-    $('#ka-use-locks').prop('checked', s.useLocks);
     $('#ka-use-wakelock').prop('checked', s.useWakeLock);
+    $('#ka-use-locks').prop('checked', s.useLocks);
 }
 
-// ==============================================
-// 初始化 UI
-// ==============================================
+// ============================================
+// 初始化
+// ============================================
 jQuery(async () => {
     const html = `
     <div id="keep-alive-panel">
         <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
-                <b>💓 智能后台保活</b>
+                <b>💓 智能后台保活 v2</b>
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content" style="display:flex;flex-direction:column;gap:6px;padding:5px 0;">
 
                 <div style="display:flex;align-items:center;gap:8px;">
                     <input id="ka-enabled" type="checkbox" />
-                    <label for="ka-enabled"><b>启用智能保活</b></label>
+                    <label for="ka-enabled"><b>启用保活</b></label>
                 </div>
 
-                <small style="opacity:0.5;padding:2px 0;">
-                    ⚡ 仅在 AI 回复时自动激活，回复完毕立即释放
+                <small style="opacity:0.5;line-height:1.4;">
+                    💙 心跳常驻（极低消耗）<br>
+                    🟢 AI 生成时自动加强保活<br>
+                    ✅ 生成完毕自动释放重资源
                 </small>
 
                 <hr style="margin:2px 0;border-color:var(--SmartThemeBorderColor);" />
-                <small style="opacity:0.6;">保活手段：</small>
+                <small style="opacity:0.6;">生成时额外启用：</small>
 
-                <div style="display:flex;align-items:center;gap:8px;font-size:13px;">
-                    <input id="ka-use-worker" type="checkbox" />
-                    <label>Worker 心跳 <small style="opacity:0.4;">(核心)</small></label>
-                </div>
                 <div style="display:flex;align-items:center;gap:8px;font-size:13px;">
                     <input id="ka-use-audio" type="checkbox" />
                     <label>静音音频 <small style="opacity:0.4;">(防冻结)</small></label>
@@ -334,9 +338,9 @@ jQuery(async () => {
 
                 <div style="margin-top:6px;padding:8px;border-radius:5px;background:var(--SmartThemeBlurTintColor);font-size:13px;">
                     <span id="ka-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#999;margin-right:4px;animation:ka-pulse 2s ease-in-out infinite;animation-play-state:paused;"></span>
-                    <span id="ka-status-text" class="ka-idle">💤 待机中</span>
+                    <span id="ka-status-text" class="ka-idle">未启动</span>
                     <span style="float:right;opacity:0.4;font-size:11px;">
-                        心跳 #<span id="ka-hb">0</span>
+                        #<span id="ka-hb">0</span>
                     </span>
                 </div>
 
@@ -349,47 +353,46 @@ jQuery(async () => {
     $('#extensions_settings').append(html);
     loadSettings();
 
-    // ===== 开关事件 =====
+    // 开关事件
     $('#ka-enabled').on('change', function () {
-        const enabled = $(this).prop('checked');
-        extension_settings[extensionName].enabled = enabled;
+        const on = $(this).prop('checked');
+        extension_settings[extensionName].enabled = on;
         saveSettingsDebounced();
-
-        if (enabled) {
-            startMonitor();
-            updateStatus('💤 待机中 (等待AI生成)', false);
-            log('✅ 智能保活已启用 — 等待 AI 生成时自动激活');
-            toastr.success('智能保活已启用');
+        if (on) {
+            startWorker();
+            updateStatus('💙 心跳待机中', 'ka-standby');
+            log('✅ 保活已启用');
+            toastr.success('保活已启用');
         } else {
-            stopMonitor();
-            deactivateKeepAlive();
+            stopWorker();
+            deactivateBoost();
             isGenerating = false;
-            updateStatus('已关闭', false);
-            log('⏸ 智能保活已关闭');
-            toastr.info('智能保活已关闭');
+            updateStatus('已关闭', '');
+            log('⏸ 保活已关闭');
+            toastr.info('保活已关闭');
         }
     });
 
     // 子开关
-    ['worker', 'audio', 'locks', 'wakelock'].forEach(key => {
+    const map = { audio: 'useAudio', locks: 'useLocks', wakelock: 'useWakeLock' };
+    Object.keys(map).forEach(key => {
         $(`#ka-use-${key}`).on('change', function () {
-            const map = { worker: 'useWorker', audio: 'useAudio', locks: 'useLocks', wakelock: 'useWakeLock' };
             extension_settings[extensionName][map[key]] = $(this).prop('checked');
             saveSettingsDebounced();
         });
     });
 
-    // ===== 监听 visibility =====
-    setupVisibilityListener();
+    // 监听可见性
+    setupVisibility();
 
-    // ===== 自动启动监控 =====
+    // 自动启动
     if (getSettings().enabled) {
         setTimeout(() => {
-            startMonitor();
-            updateStatus('💤 待机中 (等待AI生成)', false);
-            log('插件已加载 — 等待 AI 生成');
-        }, 2000);
+            startWorker();
+            updateStatus('💙 心跳待机中', 'ka-standby');
+            log('插件已加载 — Worker 心跳常驻');
+        }, 1500);
     }
 
-    console.log('[KeepAlive] ✅ 插件加载完成');
+    console.log('[KeepAlive v2] ✅ 加载完成');
 });
